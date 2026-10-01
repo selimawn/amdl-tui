@@ -12,8 +12,6 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::mpsc::Sender;
 
-use crate::api::Item;
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Format {
     Alac,
@@ -220,7 +218,7 @@ impl Plan {
 
 /// Construit la config.yaml dediee et la ligne de commande amdl.
 pub fn plan(
-    item: &Item,
+    storefront: &str,
     url: &str,
     selection: Option<&[usize]>,
     opts: &Options,
@@ -228,7 +226,7 @@ pub fn plan(
 ) -> Result<Plan, String> {
     let dir_str = save_dir.to_string_lossy().to_string();
     let overrides: Vec<(&str, String)> = vec![
-        ("storefront", quote(&item.storefront)),
+        ("storefront", quote(storefront)),
         ("lite-server", quote("http://127.0.0.1:12340")),
         ("alac-save-folder", quote(&dir_str)),
         ("atmos-save-folder", quote(&dir_str)),
@@ -301,7 +299,16 @@ pub fn plan(
 }
 
 /// Execute un plan prepare et pousse la sortie dans `tx`.
+/// Envoie `Event::Done` a la fin.
 pub fn run_plan(p: &Plan, tx: Sender<Event>) -> Result<(), String> {
+    let code = run_plan_quiet(p, tx.clone())?;
+    let _ = tx.send(Event::Done(code));
+    Ok(())
+}
+
+/// Comme `run_plan` mais SANS envoyer `Done` : utilise quand plusieurs
+/// commandes s'enchainent et qu'un seul `Done` doit conclure l'ensemble.
+pub fn run_plan_quiet(p: &Plan, tx: Sender<Event>) -> Result<i32, String> {
     let bin = amdl_bin();
     if !bin.exists() {
         return Err(format!("binaire amdl introuvable : {}", bin.display()));
@@ -349,24 +356,19 @@ pub fn run_plan(p: &Plan, tx: Sender<Event>) -> Result<(), String> {
     }
 
     let status = child.wait().map_err(|e| format!("attente amdl : {e}"))?;
-    let code = status.code().unwrap_or(-1);
-    let _ = tx.send(Event::Done(code));
-    Ok(())
+    Ok(status.code().unwrap_or(-1))
 }
 
-/// Prepare puis execute amdl.
-///
-/// `selection` = positions 1-based des pistes cochees. `None` signifie
-/// « telecharger uniquement la piste ciblee par l'URL ».
+/// Prepare puis execute amdl, pour une seule commande.
 pub fn spawn(
-    item: &Item,
+    storefront: &str,
     url: &str,
     selection: Option<&[usize]>,
     opts: &Options,
     save_dir: &PathBuf,
     tx: Sender<Event>,
 ) -> Result<(), String> {
-    let p = plan(item, url, selection, opts, save_dir)?;
+    let p = plan(storefront, url, selection, opts, save_dir)?;
     run_plan(&p, tx)
 }
 

@@ -15,9 +15,9 @@ use amdl::Format;
 fn main() -> io::Result<()> {
     let argv: Vec<String> = std::env::args().collect();
 
-    // Modes de diagnostic, sans interface graphique :
-    //   amdl-tui --probe <url>   affiche les metadonnees + la commande generee
-    //   amdl-tui --exec  <url>   lance reellement le telechargement (sortie brute)
+    // Modes de diagnostic, sans interface :
+    //   amdl-tui --probe <url>   metadonnees + commande generee, sans telecharger
+    //   amdl-tui --exec  <url>   telechargement reel, sortie brute
     if argv.len() >= 3 && (argv[1] == "--probe" || argv[1] == "--exec") {
         let url = argv[2].clone();
         let exec = argv[1] == "--exec";
@@ -88,7 +88,7 @@ fn debug_run(url: &str, selection: Option<Vec<usize>>, format: Format, exec: boo
     };
     println!("token      : {}…", &token[..token.len().min(40)]);
 
-    let item = match api::fetch_catalog(
+    let item = match api::fetch(
         parsed.storefront.as_deref().unwrap_or(&sf),
         parsed.kind,
         &parsed.id,
@@ -102,75 +102,138 @@ fn debug_run(url: &str, selection: Option<Vec<usize>>, format: Format, exec: boo
         }
     };
 
-    println!("\n=== {} — {} ===", item.title, item.artist);
-    println!("pistes : {}   max : {}", item.tracks.len(), item.max_quality_label());
-    println!("atmos  : {}   lossless : {}", item.has_atmos(), item.has_lossless());
-    for (i, t) in item.tracks.iter().enumerate() {
-        println!(
-            "  {:>3}. {:<50} {}  [{}]",
-            i + 1,
-            t.name.chars().take(50).collect::<String>(),
-            t.duration(),
-            t.quality_tag()
-        );
+    let mut item = item;
+    // --select fourni : on l'applique a l'album (mode album simple)
+    if let Some(sel) = &selection {
+        if item.albums.len() == 1 && !item.albums[0].tracks.is_empty() {
+            let a = &mut item.albums[0];
+            for (i, c) in a.checked.iter_mut().enumerate() {
+                *c = sel.contains(&(i + 1));
+            }
+        }
     }
 
+    println!("\n=== {} — {} ===", item.title, item.artist);
+    println!(
+        "{} album(s), {} pistes, max : {}",
+        item.albums.len(),
+        item.total_tracks(),
+        item.max_quality_label()
+    );
+    for (ai, alb) in item.albums.iter().enumerate() {
+        println!(
+            "\n  [{}] {} ({}) — {} pistes, {}",
+            ai,
+            alb.title,
+            alb.year,
+            alb.track_count,
+            alb.quality_tag()
+        );
+        for (ti, t) in alb.tracks.iter().enumerate() {
+            println!(
+                "      {:>3}. {:<48} {}  [{}]",
+                ti + 1,
+                t.name.chars().take(48).collect::<String>(),
+                t.duration(),
+                t.quality_tag()
+            );
+        }
+    }
+
+    // Construction des taches comme le fera l'interface
     let mut opts = amdl::Options::default();
     opts.format = format;
     let save_dir = amdl::default_save_dir();
 
-    let single = item.kind == api::Kind::Song
-        || (item.forced_track.is_some() && {
-            let s = selection.clone();
-            match s {
-                None => true,
-                Some(v) => v.len() == 1 && Some(v[0] - 1) == item.forced_track,
-            }
-        });
-    let sel_for_plan = if single { None } else { selection.as_deref() };
-    let use_url = if single { url.to_string() } else { item.base_url.clone() };
-
-    let p = match amdl::plan(&item, &use_url, sel_for_plan, &opts, &save_dir) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("plan : {e}");
-            std::process::exit(5);
-        }
+    let jobs: Vec<(String, Option<Vec<usize>>, String)> = if item.is_single_track() {
+        vec![(url.to_string(), None, item.albums[0].title.clone())]
+    } else {
+        item.albums
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| a.checked_count() > 0 && !a.tracks.is_empty())
+            .map(|(ai, a)| {
+                let pos = a.selected_positions();
+                let whole = pos.len() == a.tracks.len();
+                let u = match item.kind {
+                    api::Kind::Playlist => {
+                        format!("https://music.apple.com/{}/playlist/{}", item.storefront, a.id)
+                    }
+                    _ => format!("https://music.apple.com/{}/album/{}", item.storefront, a.id),
+                };
+                let _ = ai;
+                (
+                    u,
+                    if whole { None } else { Some(pos) },
+                    format!("{} ({} pistes)", a.title, a.tracks.len()),
+                )
+            })
+            .collect()
     };
 
-    println!("\nconfig      : {}/config.yaml", p.workdir.display());
-    println!("stdin       : {:?}", p.stdin);
-    println!("commande    : {}", p.command_line());
+    println!("\n=== {} tache(s) generee(s) ===", jobs.len());
+    for (i, (u, sel, label)) in jobs.iter().enumerate() {
+        println!("  {}. {} → {}   select={:?}", i + 1, label, u, sel);
+    }
 
-    if !exec {
-        println!("\n--- config.yaml genere ---");
-        if let Ok(txt) = std::fs::read_to_string(p.workdir.join("config.yaml")) {
-            for line in txt.lines() {
-                let l = line.trim();
-                for k in [
-                    "storefront",
-                    "alac-save-folder",
-                    "convert-after-download",
-                    "convert-format",
-                    "alac-max",
-                    "embed-lrc",
-                    "lrc-type",
-                    "exit-on-error",
-                    "lite-server",
-                ] {
-                    if l.starts_with(&format!("{k}:")) {
-                        println!("  {l}");
+    // apercu de la config pour la premiere tache
+    if let Some((u, sel, _)) = jobs.first() {
+        match amdl::plan(&item.storefront, u, sel.as_deref(), &opts, &save_dir) {
+            Ok(p) => {
+                println!("\nconfig      : {}/config.yaml", p.workdir.display());
+                println!("stdin       : {:?}", p.stdin);
+                println!("commande    : {}", p.command_line());
+                if !exec {
+                    println!("\n--- config.yaml genere ---");
+                    if let Ok(txt) = std::fs::read_to_string(p.workdir.join("config.yaml")) {
+                        for line in txt.lines() {
+                            let l = line.trim();
+                            for k in [
+                                "storefront",
+                                "alac-save-folder",
+                                "convert-after-download",
+                                "convert-format",
+                                "alac-max",
+                                "embed-lrc",
+                                "lrc-type",
+                                "exit-on-error",
+                                "lite-server",
+                            ] {
+                                if l.starts_with(&format!("{k}:")) {
+                                    println!("  {l}");
+                                }
+                            }
+                        }
                     }
                 }
             }
+            Err(e) => eprintln!("plan : {e}"),
         }
+    }
+
+    if !exec {
         return Ok(());
     }
 
     println!("\n--- execution ---");
     let (tx, rx) = channel::<amdl::Event>();
+    let url_owned = url.to_string();
     std::thread::spawn(move || {
-        let _ = amdl::run_plan(&p, tx);
+        let mut worst = 0;
+        for (u, sel, label) in jobs {
+            println!("── {label}");
+            match amdl::plan(&url_owned, &u, sel.as_deref(), &opts, &save_dir) {
+                Ok(p) => {
+                    if let Ok(c) = amdl::run_plan_quiet(&p, tx.clone()) {
+                        if c != 0 {
+                            worst = c;
+                        }
+                    }
+                }
+                Err(e) => println!("plan : {e}"),
+            }
+        }
+        let _ = tx.send(amdl::Event::Done(worst));
     });
     for ev in rx {
         match ev {

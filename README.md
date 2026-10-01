@@ -3,9 +3,13 @@
 Interface terminal (Rust + [ratatui](https://ratatui.rs)) pour
 [apple-music-downloader](https://github.com/zhaarey/apple-music-downloader).
 
-On colle une URL `music.apple.com`, l'interface récupère les métadonnées depuis
-l'API Apple, affiche les pistes d'un album, et lance `amdl` avec la bonne
-configuration.
+On colle une URL `music.apple.com` — **titre, album, playlist ou artiste** —
+l'interface récupère les métadonnées depuis l'API Apple, affiche une
+arborescence d'albums repliables, et lance `amdl` avec la bonne configuration.
+
+Coller l'URL d'un artiste liste **tous ses albums** (avec pagination) : on
+déplie ceux qui nous intéressent, on coche des pistes dans plusieurs albums à
+la fois, et le téléchargement s'enchaîne album par album.
 
 ## Prérequis
 
@@ -29,14 +33,18 @@ le piloter.
 
 | Touche | Effet |
 |---|---|
-| `Entrée` | analyser l'URL saisie / lancer le téléchargement |
+| `Entrée` | analyser l'URL saisie |
 | `Esc` | revenir en arrière, ou quitter (champ URL vide) |
 | `q` | quitter (sauf sur l'écran de saisie, où `q` s'écrit) |
 | **`Ctrl+S`** ou **`F2`** | **démarrer / arrêter colima + wrapper-lite** |
-| `↑` `↓` / `k` `j` | naviguer dans les pistes ou les options |
-| `Espace` | cocher une piste / changer une option |
-| `Tab` | passer des pistes aux options |
-| `a` / `n` / `i` | tout cocher / décocher / inverser |
+| `↑` `↓` / `k` `j` | naviguer dans l'arbre ou les options |
+| `→` / `Entrée` sur un album | déplier (et charger les pistes) |
+| `←` | replier l'album |
+| `Entrée` sur une piste | lancer le téléchargement |
+| `Espace` | cocher une piste, ou tout l'album si la ligne est un album |
+| `Tab` | passer de l'arbre aux options |
+| `a` / `n` / `i` | tout cocher / décocher / inverser (tous albums) |
+| `e` / `c` | déplier / replier l'album sous le curseur |
 
 > `Fn+S` n'est pas utilisable : la touche `Fn` sert à basculer la rangée de
 > fonctions, et l'OS l'envoie au terminal comme un simple `s`. `Ctrl+S` est
@@ -59,17 +67,50 @@ Les fichiers vont dans `~/Desktop/Musiques/<Artiste>/<Album>/`.
 
 | Fichier | Rôle |
 |---|---|
-| `src/api.rs` | token web Apple + catalogue (`amp-api.music.apple.com`), pagination |
-| `src/amdl.rs` | génère un `config.yaml` dédié, construit la commande, streame la sortie |
+| `src/api.rs` | token web Apple + catalogue (`amp-api.music.apple.com`), pagination, arbre d'albums |
+| `src/amdl.rs` | génère un `config.yaml` dédié, construit les commandes, streame la sortie |
 | `src/stack.rs` | démarrage / arrêt de colima + wrapper-lite |
-| `src/app.rs` | machine à états, clavier, messages |
-| `src/ui.rs` | rendu ratatui |
+| `src/app.rs` | machine à états, arborescence, sélection, clavier |
+| `src/ui.rs` | rendu ratatui de l'arbre et des options |
 | `src/main.rs` | boucle d'événements + modes de diagnostic |
 
-Le token est extrait du bundle JS de `music.apple.com` (2 requêtes + regex),
-exactement comme `internal/amp-api/token.go` du downloader. L'ordre des pistes
-suit `relationships.tracks.data`, ce qui garantit que les indices envoyés à
-`amdl --select` correspondent.
+### Le modèle : une arborescence d'albums
+
+`AlbumNode` est l'unité de base — un album avec ses pistes. Un `Item` contient
+une liste d'albums, ce qui couvre tous les cas d'un seul coup :
+
+| URL collée | Albums | Pistes |
+|---|---|---|
+| un titre | 1 nœud | la piste, chargée d'emblée |
+| un album | 1 nœud | chargées d'emblée |
+| une playlist | 1 nœud | chargées d'emblée |
+| **un artiste** | **N nœuds** | **chargées à la demande, au dépliage** |
+
+Un artiste peut avoir des centaines d'albums : charger toutes les pistes serait
+des centaines de requêtes. Les pistes ne sont donc récupérées **qu'au premier
+dépliage** de l'album (indicateur `⋯` pendant le chargement).
+
+### Deux détails qui comptent
+
+**Les indices de `--select`.** L'ordre des pistes suit
+`relationships.tracks.data`, exactement l'ordre que `amdl` utilise pour
+construire ses `TaskNum` (1-based). Les positions envoyées sur `stdin` tombent
+donc juste.
+
+**Le rendu de l'arbre.** Les lignes sont écrites une par une plutôt qu'avec le
+widget `List` : le défilement est ainsi maîtrisé (pour garder le curseur
+visible quel que soit le nombre d'albums dépliés) et le style de chaque ligne
+— case à cocher, flèche de pliage, badge de qualité — reste entièrement
+contrôlé.
+
+### File de téléchargement
+
+Sélectionner des pistes dans plusieurs albums produit **une tâche par album**
+(celles vides sont ignorées), exécutées séquentiellement :
+
+- album entièrement coché → pas de `--select`, l'album entier d'un coup ;
+- sélection partielle → `--select` avec les positions sur `stdin` ;
+- URL `?i=` avec une seule piste cochée → l'URL d'origine, sans `--select`.
 
 ## Modes de diagnostic
 
@@ -88,7 +129,7 @@ AMDL_TUI_DEBUG=1 $BIN
 
 ## Validation
 
-Testé le 26/09/2026 sur macOS 27.0 / Apple Silicon, storefront `tr` :
+Testé sur macOS 27.0 / Apple Silicon, storefront `tr` :
 
 | Scénario | Résultat |
 |---|---|
@@ -100,6 +141,12 @@ Testé le 26/09/2026 sur macOS 27.0 / Apple Silicon, storefront `tr` :
 | `Ctrl+S` arrêt puis redémarrage | ✅ `ok=true` dans les deux sens |
 | Ouverture sans rien démarrer | ✅ affiche `HORS LIGNE` |
 | ALAC 24-bit/96 kHz, pochette + paroles LRC intégrées | ✅ |
+| **Artiste** → tous ses albums, avec pagination | ✅ 187 albums pour Taylor Swift |
+| **Dépliage** d'un album → pistes chargées à la demande | ✅ rien n'est coché |
+| Cocher / décocher, `a` / `n` / `i` sur plusieurs albums | ✅ |
+
+Non vérifié de bout en bout : l'enchaînement de la **file multi-albums** (une
+tâche par album) — testé sur un seul album à la fois pour l'instant.
 
 ## Pièges connus
 
